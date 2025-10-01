@@ -1,0 +1,531 @@
+# backend/app/main.py
+import os
+import json
+import datetime
+from typing import Optional, List
+
+from fastapi import (
+    FastAPI, Form, HTTPException, Header, File, UploadFile, Query, Depends, BackgroundTasks
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from jose import jwt, JWTError
+from passlib.hash import bcrypt
+import psycopg2
+import psycopg2.extras
+import re
+from typing import Optional
+from fastapi import Header, HTTPException
+
+from fastapi import APIRouter, UploadFile, HTTPException
+# Config
+# -----------------------
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "supersecret123")
+API_ALLOWED_ORIGINS = os.environ.get("API_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
+
+# DATABASE_URL support: full URI or libpq-style build from parts
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    pg_host = os.environ.get("PGHOST", os.environ.get("DB_HOST", "db"))
+    pg_port = os.environ.get("PGPORT", os.environ.get("DB_PORT", "5432"))
+    pg_db = os.environ.get("PGDATABASE", os.environ.get("DB_NAME", "gis"))
+    pg_user = os.environ.get("PGUSER", os.environ.get("DB_USER", "postgres"))
+    pg_pass = os.environ.get("PGPASSWORD", os.environ.get("DB_PASS", "postgres"))
+    DATABASE_URL = f"host={pg_host} dbname={pg_db} user={pg_user} password={pg_pass} port={pg_port}"
+
+# -----------------------
+# FastAPI init
+# -----------------------
+app = FastAPI(title="BAS-analytics-MVP")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+origins = [o.strip() for o in API_ALLOWED_ORIGINS.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins or ["http://localhost:5173", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------
+# DB helper
+# -----------------------
+def get_conn():
+    # psycopg2.connect supports both URI and libpq-style DSN passed above
+    return psycopg2.connect(DATABASE_URL)
+
+# -----------------------
+# Models
+# -----------------------
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class User(BaseModel):
+    username: str
+    role: str
+
+class FlightIn(BaseModel):
+    flight_id: Optional[str] = None
+    uav_type: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    start_lat: Optional[float] = None
+    start_lon: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lon: Optional[float] = None
+    raw: Optional[dict] = None
+
+# -----------------------
+# Auth helpers
+# -----------------------
+def create_access_token(data: dict, expires_delta: Optional[datetime.timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_user_from_db(username: str) -> Optional[User]:
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT username, role FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
+        cur.close()
+        if row:
+            return User(username=row[0], role=row[1])
+        return None
+    except Exception:
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def verify_password(username: str, plain_password: str) -> bool:
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT hashed_password FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return False
+        hashed = row[0]
+        return bcrypt.verify(plain_password, hashed)
+    except Exception:
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+    credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        role: str = payload.get("role")
+        if username is None or role is None:
+            raise credentials_exception
+        return User(username=username, role=role)
+    except JWTError:
+        raise credentials_exception
+
+def admin_auth(authorization: Optional[str] = Header(None)):
+    """
+    Accept either:
+      - Authorization: Bearer <ADMIN_TOKEN>  (dev token from env) OR
+      - Authorization: Bearer <JWT>  where JWT has payload role=='admin'
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization format")
+    token = authorization.split(" ", 1)[1]
+    if token == ADMIN_TOKEN:
+        return
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        role = payload.get("role")
+        if role != "admin":
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# -----------------------
+# Auth endpoints
+# -----------------------
+@app.post("/token", response_model=Token)
+def token(form_data: OAuth2PasswordRequestForm = Depends()):
+    username = form_data.username
+    password = form_data.password
+    if username == "admin" and password == ADMIN_TOKEN:
+        return {"access_token": ADMIN_TOKEN, "token_type": "bearer"}
+    if not verify_password(username, password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    user = get_user_from_db(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    access_token = create_access_token(data={"sub": user.username, "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/login")
+def login_form(username: str = Form(...), password: str = Form(...)):
+    if username == "admin" and password == ADMIN_TOKEN:
+        return {"access_token": ADMIN_TOKEN, "token_type": "bearer", "role": "admin"}
+    if not verify_password(username, password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    user = get_user_from_db(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    token = create_access_token({"sub": user.username, "role": user.role})
+    return {"access_token": token, "token_type": "bearer", "role": user.role}
+
+# -----------------------
+# Health
+# -----------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# -----------------------
+# Public data endpoints
+# -----------------------
+@app.get("/api/v1/regions")
+def regions_list(limit: int = Query(500, ge=1, le=2000)):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(
+            "SELECT gid, name, ST_AsGeoJSON(geom) AS geojson FROM public.regions ORDER BY name LIMIT %s",
+            (limit,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [{"gid": r["gid"], "name": r["name"], "geojson": json.loads(r["geojson"])} for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/api/v1/top-regions")
+def top_regions(limit: int = Query(20, ge=1, le=200), date_from: Optional[str] = None, date_to: Optional[str] = None):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        where = []
+        params = []
+        if date_from:
+            where.append("f.start_time >= %s"); params.append(date_from)
+        if date_to:
+            where.append("f.start_time <= %s"); params.append(date_to)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT r.gid, r.name, COUNT(*) AS cnt,
+                   AVG(EXTRACT(EPOCH FROM (f.end_time - f.start_time))) AS avg_dur
+            FROM flights f
+            JOIN public.regions r ON f.start_region_id = r.gid
+            {where_sql}
+            GROUP BY r.gid, r.name
+            ORDER BY cnt DESC
+            LIMIT %s
+        """
+        params.append(limit)
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        cur.close()
+        results = []
+        for r in rows:
+            results.append({
+                "gid": r["gid"],
+                "name": r["name"],
+                "count": int(r["cnt"]),
+                "avg_duration_seconds": None if r["avg_dur"] is None else float(r["avg_dur"])
+            })
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/api/v1/flights")
+def list_flights(
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    region_id: Optional[int] = None,
+    uav_type: Optional[str] = None
+):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        where = []
+        params = []
+        if date_from:
+            where.append("f.start_time >= %s"); params.append(date_from)
+        if date_to:
+            where.append("f.start_time <= %s"); params.append(date_to)
+        if region_id:
+            where.append("(f.start_region_id = %s OR f.end_region_id = %s)"); params.extend([region_id, region_id])
+        if uav_type:
+            where.append("f.uav_type = %s"); params.append(uav_type)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+          SELECT f.id, f.flight_id, f.uav_type, f.start_time, f.end_time,
+                 EXTRACT(EPOCH FROM (f.end_time - f.start_time)) AS duration_seconds,
+                 ST_AsText(f.start_geom) AS start_geom_wkt,
+                 ST_AsText(f.end_geom) AS end_geom_wkt,
+                 f.start_region_id, f.end_region_id
+          FROM flights f
+          {where_sql}
+          ORDER BY f.start_time DESC NULLS LAST
+          LIMIT %s OFFSET %s
+        """
+        params.extend([limit, offset])
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        cur.close()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "flight_id": r["flight_id"],
+                "uav_type": r["uav_type"],
+                "start_time": r["start_time"].isoformat() if r["start_time"] else None,
+                "end_time": r["end_time"].isoformat() if r["end_time"] else None,
+                "duration_seconds": None if r["duration_seconds"] is None else int(r["duration_seconds"]),
+                "start_geom_wkt": r["start_geom_wkt"],
+                "end_geom_wkt": r["end_geom_wkt"],
+                "start_region_id": r["start_region_id"],
+                "end_region_id": r["end_region_id"]
+            })
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+# -----------------------
+# Upload + import endpoints (admin only)
+# -----------------------
+@app.post("/api/v1/upload")
+async def upload_ndjson(file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+    admin_auth(authorization)  # will raise if not allowed
+    dest_path = "/data/uploaded_parsed.ndjson"
+    try:
+        contents = await file.read()
+        os.makedirs("/data", exist_ok=True)
+        with open(dest_path, "wb") as fh:
+            fh.write(contents)
+        return {"status": "uploaded", "path": dest_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed save file: {e}")
+
+@app.post("/api/v1/import_from_upload")
+def import_from_upload(authorization: Optional[str] = Header(None)):
+    """
+    Безопасный импорт: берет /data/uploaded_parsed.ndjson (в API контейнере),
+    построчно наполняет staging_raw, затем выполняет load_from_staging.sql (если есть).
+    Это НЕ использует psql-метакоманду \COPY и поэтому безопасно для выполнения
+    через psycopg2.
+    """
+    admin_auth(authorization)
+    upload_path = "/data/uploaded_parsed.ndjson"
+    load_sql_path = "/data/load_from_staging.sql"
+
+    if not os.path.exists(upload_path):
+        raise HTTPException(status_code=400, detail=f"Upload file not found: {upload_path}")
+
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        # 1) Очистим staging_raw
+        cur.execute("TRUNCATE staging_raw;")
+        conn.commit()
+
+        # 2) Вставляем построчно (каждая строка — JSON text)
+        inserted = 0
+        with open(upload_path, "r", encoding="utf-8") as fh:
+            batch = []
+            BATCH = 1000  # вставлять батчами для скорости/памяти
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                batch.append((line,))
+                if len(batch) >= BATCH:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        "INSERT INTO staging_raw (raw) VALUES %s",
+                        batch,
+                        template="(%s)"
+                    )
+                    conn.commit()
+                    inserted += len(batch)
+                    batch = []
+            if batch:
+                psycopg2.extras.execute_values(
+                    cur,
+                    "INSERT INTO staging_raw (raw) VALUES %s",
+                    batch,
+                    template="(%s)"
+                )
+                conn.commit()
+                inserted += len(batch)
+
+        # 3) Выполнить SQL-трансформации (если есть файл load_from_staging.sql)
+        if os.path.exists(load_sql_path):
+            with open(load_sql_path, "r", encoding="utf-8") as fh:
+                sql = fh.read()
+            cur.execute("BEGIN;")
+            cur.execute(sql)
+            cur.execute("COMMIT;")
+            conn.commit()
+            cur.close()
+            return {"status": "imported", "inserted_rows": inserted, "note": "staging filled and load script executed"}
+        else:
+            cur.close()
+            return {"status": "copied", "inserted_rows": inserted, "note": f"{load_sql_path} not found; run load script in DB manually (or place it in /data)"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Import failed: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+
+# -----------------------
+# Job-based async import (BackgroundTasks)
+# -----------------------
+def do_import_job(job_id: int, file_url: str):
+    """Background worker: copy file -> run load SQL -> update import_jobs"""
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        # mark running
+        cur.execute("UPDATE import_jobs SET status='running', updated_at=now() WHERE id=%s", (job_id,))
+        conn.commit()
+
+        if not os.path.exists(file_url):
+            raise Exception(f"File not found for job: {file_url}")
+
+        # Truncate staging_raw
+        cur.execute("TRUNCATE staging_raw;")
+        conn.commit()
+
+        # COPY via copy_expert (stream)
+        with open(file_url, "r", encoding="utf-8") as fh:
+            cur.copy_expert("COPY staging_raw(raw) FROM STDIN WITH (FORMAT text)", fh)
+        conn.commit()
+
+        # Execute load script if exists
+        load_sql_path = "/data/load_from_staging.sql"
+        if os.path.exists(load_sql_path):
+            with open(load_sql_path, "r", encoding="utf-8") as fh_sql:
+                sql = fh_sql.read()
+            cur.execute("BEGIN;")
+            cur.execute(sql)
+            cur.execute("COMMIT;")
+            conn.commit()
+
+        # success
+        cur.execute("UPDATE import_jobs SET status='success', updated_at=now() WHERE id=%s", (job_id,))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+            try:
+                cur.execute("UPDATE import_jobs SET status='failed', error=%s, updated_at=now() WHERE id=%s", (str(e), job_id))
+                conn.commit()
+            except Exception:
+                pass
+        print(f"[import job {job_id}] failed: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+@app.post("/api/v1/import")
+def start_import(payload: dict, background_tasks: BackgroundTasks, authorization: Optional[str] = Header(None)):
+    """
+    Start import job. payload: { "file_url": "/data/uploaded_parsed.ndjson" }
+    Returns job_id. Job runs in background (FastAPI process).
+    """
+    admin_auth(authorization)
+    file_url = payload.get("file_url")
+    if not file_url:
+        raise HTTPException(status_code=400, detail="file_url required")
+
+    # Insert job record
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO import_jobs (file_url, status, created_at, updated_at) VALUES (%s,'pending', now(), now()) RETURNING id", (file_url,))
+        job_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed create job: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    # schedule background task
+    background_tasks.add_task(do_import_job, job_id, file_url)
+    return {"job_id": job_id, "status": "queued"}
+
+@app.get("/api/v1/job/{job_id}")
+def get_job(job_id: int, authorization: Optional[str] = Header(None)):
+    # admin-only view: requires admin token
+    admin_auth(authorization)
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT id, file_url, status, created_at, updated_at, error FROM import_jobs WHERE id=%s", (job_id,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {
+            "id": row["id"],
+            "file_url": row["file_url"],
+            "status": row["status"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            "error": row["error"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()

@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgis/postgis:15-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: gis
+    volumes:
+      - ./data:/data       # общая папка для загрузки/импорта
+      - postgis_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  api:
+    build:
+      context: .          # корень Hacatonreal/
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/gis"
+      ADMIN_TOKEN: "supersecret123"
+      SECRET_KEY: "dev-secret-change-me"
+      API_ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:5173"
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./data:/data      # общая папка для загрузки/импорта
+
+volumes:
+  postgis_data:

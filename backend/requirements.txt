@@ -1,0 +1,13 @@
+psycopg2-binary
+pydantic
+python-dotenv
+shapely
+geojson
+uvicorn[standard]
+fastapi
+python-multipart
+python-multipart==0.0.6
+python-jose[cryptography]
+passlib[bcrypt]
+
+
